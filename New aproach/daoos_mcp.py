@@ -15,10 +15,10 @@ from langchain_openai import ChatOpenAI
 # LangChain / LangGraph / MCP
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage, BaseMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
-from langgraph.prebuilt import ToolNode, create_react_agent
+from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 
@@ -36,12 +36,16 @@ def _load_env():
 
 _load_env()
 
-# Use environment variables for better security
+# Use environment variables ONLY (do not hardcode secrets)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-
 NOTION_MCP_TOKEN = os.getenv("NOTION_MCP_TOKEN")
-NOTION_VERSION = "2022-06-28"
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY is not set in environment.")
+if not NOTION_MCP_TOKEN:
+    logger.warning("NOTION_MCP_TOKEN is not set in environment.")
+
+NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
 CACHE_FILE = Path("workspace_cache.pkl")
 CACHE_DURATION = timedelta(minutes=30)  # Reduced cache duration for fresher data
 
@@ -53,7 +57,7 @@ notion_cfg = {
         "transport": "stdio",
         "env": {
             "OPENAPI_MCP_HEADERS": json.dumps({
-                "Authorization": f"Bearer {NOTION_MCP_TOKEN}",
+                "Authorization": f"Bearer {NOTION_MCP_TOKEN}" if NOTION_MCP_TOKEN else "",
                 "Notion-Version": NOTION_VERSION,
             })
         },
@@ -96,7 +100,8 @@ class UniversalWorkspaceKnowledge:
         self._context_cache = None  # Invalidate cache
 
     def add_schema(self, db_id: str, props: Dict[str, PropertyDetails]):
-        self.schemas[db_id] = EntitySchema(db_id, self.entities[db_id].name, props)
+        name = self.entities.get(db_id).name if db_id in self.entities else db_id
+        self.schemas[db_id] = EntitySchema(db_id, name, props)
         self._context_cache = None  # Invalidate cache
 
     def add_user(self, uid: str, name: str):
@@ -135,7 +140,7 @@ class UniversalWorkspaceKnowledge:
         """Cached context generation"""
         if self._context_cache is not None:
             return self._context_cache
-        
+
         lines = ["=== WORKSPACE SCHEMA ==="]
         for eid, ent in self.entities.items():
             lines.append(f"\n*{ent.name}* (DB ID: {eid})")
@@ -145,64 +150,65 @@ class UniversalWorkspaceKnowledge:
                     req = " (required)" if pdet.constraints.required else ""
                     opts = ""
                     if pdet.constraints.options:
-                        opts = " | opts: " + ", ".join(o["name"] for o in pdet.constraints.options)
+                        opts = " | opts: " + ", ".join(o.get("name", "") for o in pdet.constraints.options)
                     lines.append(f"  • {pname}: {pdet.type}{req}{opts}")
         if self.users:
             lines.append("\n=== USERS ===")
             for name, uid in self.users.items():
                 lines.append(f"  • {name} → {uid}")
-        
+
         self._context_cache = "\n".join(lines)
         return self._context_cache
 
 # ────────────────────── Ultra-Optimized Discovery with Batching ──────────────────────
 async def discover_structure_optimized(node: ToolNode, know: UniversalWorkspaceKnowledge):
     """Ultra-optimized discovery with concurrent processing"""
-    
-    # Step 1: Discover databases and users simultaneously
+
     logger.info("🔍 Discovering databases and users in parallel...")
-    
+
     parallel_tasks = [
         {
             "name": "API-post-search",
             "args": {"filter": {"property": "object", "value": "database"}},
-            "id": "db_search"
+            "id": "db_search",
         },
         {
             "name": "API-get-users",
             "args": {},
-            "id": "users"
-        }
+            "id": "users",
+        },
     ]
-    
+
     resp = await node.ainvoke({
         "messages": [AIMessage(content="", tool_calls=parallel_tasks)]
     })
-    
-    db_ids = []
-    
-    # Process responses concurrently
+
+    db_ids: List[str] = []
+
     for m in resp["messages"]:
         if isinstance(m, ToolMessage):
-            data = json.loads(m.content)
-            
+            try:
+                data = json.loads(m.content)
+            except Exception:
+                logger.warning("Non-JSON tool response during discovery; skipping.")
+                continue
+
             if m.tool_call_id == "db_search":
                 for item in data.get("results", []):
-                    if item["object"] == "database":
+                    if item.get("object") == "database":
                         eid = item["id"]
-                        name = "".join(t["plain_text"] for t in item["title"])
+                        title = item.get("title") or []
+                        name = "".join(t.get("plain_text", "") for t in title) or eid
                         know.add_entity(eid, name)
                         db_ids.append(eid)
-            
+
             elif m.tool_call_id == "users":
                 for u in data.get("results", []):
-                    know.add_user(u["id"], u.get("name", "Unknown"))
+                    know.add_user(u.get("id", ""), u.get("name", "Unknown"))
 
     # Step 2: Batch schema discovery with controlled concurrency
     if db_ids:
         logger.info(f"📊 Fetching schemas for {len(db_ids)} databases...")
-        
-        # Process schemas in smaller batches to avoid overwhelming the API
         BATCH_SIZE = 5
         for i in range(0, len(db_ids), BATCH_SIZE):
             batch = db_ids[i:i + BATCH_SIZE]
@@ -210,32 +216,36 @@ async def discover_structure_optimized(node: ToolNode, know: UniversalWorkspaceK
                 {
                     "name": "API-retrieve-a-database",
                     "args": {"database_id": db},
-                    "id": f"schema_{db}"
+                    "id": f"schema_{db}",
                 }
                 for db in batch
             ]
-            
+
             batch_resp = await node.ainvoke({
                 "messages": [AIMessage(content="", tool_calls=schema_tasks)]
             })
-            
-            # Process batch responses
+
             for m in batch_resp["messages"]:
                 if isinstance(m, ToolMessage) and m.tool_call_id.startswith("schema_"):
-                    data = json.loads(m.content)
+                    try:
+                        data = json.loads(m.content)
+                    except Exception:
+                        logger.warning("Non-JSON schema response; skipping.")
+                        continue
+
                     db_id = m.tool_call_id.replace("schema_", "")
-                    props = {}
-                    for pname, pdat in data["properties"].items():
-                        typ = pdat["type"]
+                    props: Dict[str, PropertyDetails] = {}
+                    for pname, pdat in data.get("properties", {}).items():
+                        typ = pdat.get("type", "unknown")
                         req = pname.lower() in ("name", "title")
                         opts = None
                         if typ in ("select", "status", "multi_select"):
-                            opts = pdat.get(typ, {}).get("options")
+                            opts = (pdat.get(typ) or {}).get("options")
                         props[pname] = PropertyDetails(pname, typ, FieldConstraints(req, opts))
                     know.add_schema(db_id, props)
 
     know.last_updated = datetime.now()
-    await know.save_to_cache()  # Async cache save
+    await know.save_to_cache()
     return know
 
 # ────────────────── Streamlined System Prompt ──────────────────
@@ -267,71 +277,90 @@ def make_optimized_system_prompt(know: UniversalWorkspaceKnowledge):
         + "\n" + know.context()
     )
 
+# ─────────────────── Bundle-aware history stitching helpers ───────────────────
+def _bundle_messages(messages: List[BaseMessage]) -> List[List[BaseMessage]]:
+    """
+    Convert a flat list into bundles:
+    - Normal message -> its own bundle [msg]
+    - Assistant-with-tool_calls -> [assistant, tool_msg1, tool_msg2, ...] if all tool responses follow contiguously.
+      If any tool response missing, the entire assistant-with-tools bundle is DROPPED (keeps history valid).
+    """
+    bundles: List[List[BaseMessage]] = []
+    i = 0
+    n = len(messages)
+
+    while i < n:
+        m = messages[i]
+
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            tool_ids = [tc.get("id") for tc in (m.tool_calls or []) if isinstance(tc, dict)]
+            idset = set(tool_ids)
+            j = i + 1
+            collected_tool_msgs: List[ToolMessage] = []
+
+            while j < n and isinstance(messages[j], ToolMessage) and messages[j].tool_call_id in idset:
+                collected_tool_msgs.append(messages[j])
+                idset.remove(messages[j].tool_call_id)
+                j += 1
+
+            if idset:
+                logger.warning("Dropped assistant tool-call bundle due to missing tool replies; keeping history valid.")
+                i = j
+                continue
+            else:
+                bundles.append([m] + collected_tool_msgs)
+                i = j
+                continue
+
+        bundles.append([m])
+        i += 1
+
+    return bundles
+
+
+def _flatten(bundles: List[List[BaseMessage]]) -> List[BaseMessage]:
+    out: List[BaseMessage] = []
+    for b in bundles:
+        out.extend(b)
+    return out
+
+
+def _trim_bundles_from_start(bundles: List[List[BaseMessage]], max_messages: int) -> List[List[BaseMessage]]:
+    """
+    Trim from the start while keeping bundles intact (never split an assistant-with-tools + its tool replies).
+    max_messages counts individual messages, not bundles.
+    """
+    total = sum(len(b) for b in bundles)
+    if total <= max_messages:
+        return bundles
+
+    trimmed = list(bundles)
+    while trimmed and sum(len(b) for b in trimmed) > max_messages:
+        trimmed.pop(0)
+    return trimmed
+
 # ──────────────────── High-Performance Agent & Workflow ────────────────────
 class OptimizedState(MessagesState):
     context: Optional[str] = None  # Store context to avoid regeneration
 
-def smart_message_trimming(messages: List, max_messages: int = 8) -> List:
-    """Intelligent message trimming that preserves tool call/response pairs"""
-    if len(messages) <= max_messages:
-        return messages
-    
-    # Keep system messages
-    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
-    non_system = [m for m in messages if not isinstance(m, SystemMessage)]
-    
-    if len(non_system) <= max_messages - len(system_msgs):
-        return system_msgs + non_system
-    
-    # Smart trimming that preserves tool call/response pairs
-    keep_messages = []
-    i = len(non_system) - 1
-    
-    while i >= 0 and len(keep_messages) < (max_messages - len(system_msgs)):
-        current_msg = non_system[i]
-        
-        # If this is a tool message, find its corresponding tool call
-        if isinstance(current_msg, ToolMessage):
-            # Find the AI message with tool calls that this responds to
-            for j in range(i-1, -1, -1):
-                if isinstance(non_system[j], AIMessage) and getattr(non_system[j], 'tool_calls', None):
-                    # Check if this tool call matches
-                    for tool_call in non_system[j].tool_calls:
-                        if tool_call['id'] == current_msg.tool_call_id:
-                            # Add both messages as a pair
-                            keep_messages.insert(0, non_system[j])
-                            keep_messages.insert(1, current_msg)
-                            i = j - 1
-                            break
-                    break
-            else:
-                # No matching tool call found, skip this tool message
-                i -= 1
-        else:
-            # Add regular messages
-            keep_messages.insert(0, current_msg)
-            i -= 1
-    
-    return system_msgs + keep_messages
-
 async def build_optimized_app():
     logger.info("🚀 Initializing optimized MCP client...")
-    
-    # Use connection pooling and timeout optimization
+
+    # MCP client + tools
     client = MultiServerMCPClient(notion_cfg)
-    tools = await asyncio.wait_for(client.get_tools(), timeout=15)
-    
+    tools = await asyncio.wait_for(client.get_tools(), timeout=30)
+
     # Optimized model configuration with streaming
     llm = ChatOpenAI(
-        model="gpt-4o-mini",  # Use gpt-4o for better speed/quality balance
+        model="gpt-4o-mini",
         api_key=OPENAI_API_KEY,
-        temperature=0.1,  # Lower for more consistent responses
-        max_tokens=2000,  # Reasonable limit
+        temperature=0.1,
+        max_tokens=2000,
         timeout=120,
-        streaming=True,  # Enable streaming for perceived speed
-        max_retries=2,   # Reduce retries for faster failure
+        streaming=True,
+        max_retries=2,
     ).bind_tools(tools)
-    
+
     node = ToolNode(tools)
 
     # Try async cache loading first
@@ -340,80 +369,58 @@ async def build_optimized_app():
         logger.info("🔄 Refreshing workspace schema...")
         know = UniversalWorkspaceKnowledge()
         await discover_structure_optimized(node, know)
-    
+
     logger.info(f"✅ Workspace ready! Found {len(know.entities)} databases, {len(know.users)} users")
 
     # Pre-compile optimized system prompt
     system_prompt = make_optimized_system_prompt(know)
     sys_message = SystemMessage(content=system_prompt)
 
-    # Custom agent function with proper message handling
+    # Custom agent function with strict, safe history
     async def agent_fn(state: OptimizedState):
-        # Get all messages and ensure proper pairing
         all_messages = state["messages"]
-        
-        # Filter and prepare messages for the LLM
-        prepared_messages = []
-        
-        # Always include system message first
-        prepared_messages.append(sys_message)
-        
-        # Add conversation messages, ensuring tool call/response pairs
+
+        # ---- Build a safe, strictly valid history for the LLM ----
+        # Exclude any prior system messages; we insert our current system prompt at the top.
         conversation_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
-        
-        # Keep only the most recent meaningful conversation
-        if len(conversation_msgs) > 10:  # Keep more messages but clean
-            conversation_msgs = conversation_msgs[-10:]
-        
-        # Validate message sequence
-        valid_messages = []
-        for i, msg in enumerate(conversation_msgs):
-            if isinstance(msg, ToolMessage):
-                # Only include tool messages that have a preceding tool call
-                if valid_messages and isinstance(valid_messages[-1], AIMessage):
-                    if hasattr(valid_messages[-1], 'tool_calls') and valid_messages[-1].tool_calls:
-                        # Check if tool call ID matches
-                        tool_call_ids = [tc['id'] for tc in valid_messages[-1].tool_calls]
-                        if msg.tool_call_id in tool_call_ids:
-                            valid_messages.append(msg)
-                # Skip orphaned tool messages
-            else:
-                valid_messages.append(msg)
-        
-        prepared_messages.extend(valid_messages)
-        
+
+        # Bundle to ensure no orphaned tool-calls sneak in
+        bundles = _bundle_messages(conversation_msgs)
+
+        # Keep recent context but NEVER split bundles
+        bundles = _trim_bundles_from_start(bundles, max_messages=16)  # tune as needed
+
+        valid_messages = _flatten(bundles)
+
+        # Final payload sent to LLM must start with the current system prompt
+        prepared_messages: List[BaseMessage] = [sys_message] + valid_messages
+
         try:
-            # Use asyncio.create_task for better concurrency
             task = asyncio.create_task(llm.ainvoke(prepared_messages))
-            resp = await asyncio.wait_for(task, timeout=20)
-            
-            # Return with properly managed messages
+            resp = await asyncio.wait_for(task, timeout=30)
             return {"messages": all_messages + [resp]}
-            
         except asyncio.TimeoutError:
             error_msg = AIMessage(content="⏰ Request timed out. Please try a simpler query.")
             return {"messages": all_messages + [error_msg]}
         except Exception as e:
             logger.error(f"Agent error: {e}")
-            # Check if it's a tool message validation error
-            if "tool" in str(e).lower() and "role" in str(e).lower():
-                logger.info("🔧 Cleaning message history due to tool message error")
-                # Start fresh but keep the latest human message
-                latest_human = None
-                for msg in reversed(all_messages):
-                    if isinstance(msg, HumanMessage):
-                        latest_human = msg
-                        break
-                
-                if latest_human:
-                    clean_messages = [latest_human]
-                    task = asyncio.create_task(llm.ainvoke([sys_message] + clean_messages))
-                    try:
-                        resp = await asyncio.wait_for(task, timeout=20)
-                        return {"messages": clean_messages + [resp]}
-                    except Exception as e2:
-                        logger.error(f"Retry failed: {e2}")
-            
+            # Clean reset fallback: keep only latest human message (if any)
+            latest_human = None
+            for msg in reversed(all_messages):
+                if isinstance(msg, HumanMessage):
+                    latest_human = msg
+                    break
+
+            if latest_human:
+                try:
+                    resp = await asyncio.wait_for(
+                        llm.ainvoke([sys_message, latest_human]),
+                        timeout=20
+                    )
+                    return {"messages": [latest_human, resp]}
+                except Exception as e2:
+                    logger.error(f"Retry failed: {e2}")
+
             error_msg = AIMessage(content=f"❌ Error: {str(e)}")
             return {"messages": all_messages + [error_msg]}
 
@@ -426,57 +433,53 @@ async def build_optimized_app():
     async def optimized_tool_node(state: OptimizedState):
         """Optimized tool node with proper error handling"""
         try:
-            # Use asyncio.wait_for with a reasonable timeout
-            result = await asyncio.wait_for(node.ainvoke(state), timeout=25)
-            
-            # Don't trim messages here to preserve tool call/response pairs
+            # IMPORTANT: pass the entire state (it contains the 'messages' key),
+            # ToolNode expects {"messages":[...]} in the state.
+            result = await asyncio.wait_for(node.ainvoke(state), timeout=40)
             return result
-            
         except asyncio.TimeoutError:
             logger.warning("Tool execution timed out")
-            
+
             # Find the last AI message with tool calls to respond to
-            last_ai_msg = None
+            last_ai_msg: Optional[AIMessage] = None
             for msg in reversed(state["messages"]):
-                if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
                     last_ai_msg = msg
                     break
-            
+
             if last_ai_msg and last_ai_msg.tool_calls:
-                # Create timeout responses for each tool call
-                timeout_responses = []
+                timeout_responses: List[ToolMessage] = []
                 for tool_call in last_ai_msg.tool_calls:
-                    timeout_responses.append(ToolMessage(
-                        content="⏰ Tool execution timed out. Please try a simpler operation.", 
-                        tool_call_id=tool_call['id']
-                    ))
+                    timeout_responses.append(
+                        ToolMessage(
+                            content="⏰ Tool execution timed out. Please try a simpler operation.",
+                            tool_call_id=tool_call.get("id"),
+                        )
+                    )
                 return {"messages": state["messages"] + timeout_responses}
             else:
-                # Fallback error message
                 error_msg = AIMessage(content="⏰ Tool execution timed out. Please try a simpler operation.")
                 return {"messages": state["messages"] + [error_msg]}
-                
         except Exception as e:
             logger.error(f"Tool error: {e}")
-            
-            # Find the last AI message with tool calls to respond to
-            last_ai_msg = None
+
+            last_ai_msg: Optional[AIMessage] = None
             for msg in reversed(state["messages"]):
-                if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
                     last_ai_msg = msg
                     break
-            
+
             if last_ai_msg and last_ai_msg.tool_calls:
-                # Create error responses for each tool call
-                error_responses = []
+                error_responses: List[ToolMessage] = []
                 for tool_call in last_ai_msg.tool_calls:
-                    error_responses.append(ToolMessage(
-                        content=f"❌ Tool error: {str(e)}", 
-                        tool_call_id=tool_call['id']
-                    ))
+                    error_responses.append(
+                        ToolMessage(
+                            content=f"❌ Tool error: {str(e)}",
+                            tool_call_id=tool_call.get("id"),
+                        )
+                    )
                 return {"messages": state["messages"] + error_responses}
             else:
-                # Fallback error message
                 error_msg = AIMessage(content=f"❌ Tool error: {str(e)}")
                 return {"messages": state["messages"] + [error_msg]}
 
@@ -487,7 +490,7 @@ async def build_optimized_app():
     wf.add_edge(START, "agent")
     wf.add_conditional_edges("agent", router, {"tools": "tools", END: END})
     wf.add_edge("tools", "agent")
-    
+
     return wf.compile(checkpointer=MemorySaver())
 
 # ──────────────────────────── Optimized Main with Streaming ────────────────────────────
@@ -495,34 +498,30 @@ async def main():
     try:
         app = await build_optimized_app()
         logger.info("✨ High-performance MCP-driven Notion assistant ready! Type 'quit' to exit.\n")
-        
+
         while True:
             try:
                 q = input("\n💬 You: ").strip()
                 if q.lower() in ("quit", "exit", "q"):
                     break
-                
+
                 print("🤖 Assistant:", end=" ", flush=True)
-                
-                # Use a clean thread ID for each session to avoid message history issues
+
+                # Use a clean thread ID per turn to avoid accidental long contexts
                 thread_id = f"mcp_session_{int(asyncio.get_event_loop().time())}"
                 config = {"configurable": {"thread_id": thread_id}}
-                
-                # Use asyncio.create_task for better performance
+
                 start_time = asyncio.get_event_loop().time()
-                
                 task = asyncio.create_task(
                     app.ainvoke({"messages": [HumanMessage(content=q)]}, config=config)
                 )
-                
-                result = await asyncio.wait_for(task, timeout=40)  # Slightly longer timeout
-                
+                result = await asyncio.wait_for(task, timeout=60)
                 elapsed = asyncio.get_event_loop().time() - start_time
+
                 out = result["messages"][-1].content
-                
                 print(f"{out}")
                 logger.info(f"⚡ Response time: {elapsed:.2f}s")
-                
+
             except asyncio.TimeoutError:
                 print("⏰ Request timed out. Please try a simpler query.")
             except KeyboardInterrupt:
@@ -531,18 +530,46 @@ async def main():
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
                 print(f"❌ Error: {e}")
-                
+
     except Exception as e:
         logger.error(f"Failed to initialize: {e}")
         print(f"❌ Failed to initialize: {e}")
 
+# if __name__ == "__main__":
+#     # Use uvloop for better async performance on Unix systems
+#     # try:
+#     #     import uvloop
+#     #     uvloop.install()
+#     #     logger.info("🚀 Using uvloop for enhanced performance")
+#     # except ImportError:
+#     #     logger.info("📝 Using default asyncio event loop")
+
+#     asyncio.run(main())
+
+# Function to interface with the agent
+def interact_with_agent(user_input):
+    # Call the existing assistant function or workflow here
+    try:
+        result = asyncio.run(main_input(user_input))
+        return result['messages'][-1].content  # Assuming this is the response
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Create a Gradio interface
+def create_gradio_interface():
+    # Create a Gradio interface for text input/output
+    iface = gr.Interface(
+        fn=interact_with_agent,  # The function to call when the user inputs text
+        inputs=gr.Textbox(lines=5, placeholder="Ask me anything..."),  # Input area
+        outputs=gr.Textbox(lines=5, placeholder="Response will appear here..."),  # Output area
+        live=True,  # Set to True for live updates while typing (optional)
+        title="Notion MCP AI Assistant",  # Title of the interface
+        description="Interact with the Notion MCP-driven AI assistant. Ask anything, and it will respond based on workspace data."
+    )
+
+    # Launch the interface
+    iface.launch(share=True)  # Set 'share=True' if you want to share the interface publicly
+
+# If this is the main module, start the Gradio interface
 if __name__ == "__main__":
-    # Use uvloop for better async performance on Unix systems
-    # try:
-    #     import uvloop
-    #     uvloop.install()
-    #     logger.info("🚀 Using uvloop for enhanced performance")
-    # except ImportError:
-    #     logger.info("📝 Using default asyncio event loop")
-    
-    asyncio.run(main())
+    create_gradio_interface()
