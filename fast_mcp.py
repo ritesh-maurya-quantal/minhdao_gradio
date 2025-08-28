@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 import asyncio
 import textwrap
 from typing import Dict, List, Optional, Any
@@ -9,18 +8,12 @@ from dataclasses import dataclass, field
 import pickle
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import atexit
-
-import qdrant_client
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import PointStruct, Filter, FieldCondition, MatchValue
-from sentence_transformers import SentenceTransformer
-import numpy as np
 
 from langchain_openai import ChatOpenAI
 # LangChain / LangGraph / MCP
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
@@ -37,7 +30,6 @@ def _load_env():
 
 _load_env()
 
-# Use environment variables for better security
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 
@@ -59,114 +51,6 @@ notion_cfg = {
         },
     }
 }
-
-# ───────────────────────────────── Qdrant Memory ─────────────────────────
-QDRANT_COLLECTION = "chat_memory"
-QDRANT_MEMORY_LIMIT = 3
-QDRANT_TOP_K = 5
-QDRANT_PATH = os.path.join(os.path.dirname(__file__), "qdrant_storage")
-
-class QdrantMemory: #Qdrant Class for storing chat memory- this DB is stored locally. Note: you need to specify the Qdrant DB path in configurtion during deployment 
-    def __init__(self, collection=QDRANT_COLLECTION, memory_limit=QDRANT_MEMORY_LIMIT):
-        # Ensure storage directory exists
-        os.makedirs(QDRANT_PATH, exist_ok=True)
-        self.client = QdrantClient(path=QDRANT_PATH)
-        self.collection = collection
-        self.memory_limit = memory_limit
-        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
-        self._ensure_collection()
-        
-        # Register cleanup
-        atexit.register(self.cleanup)
-
-    def cleanup(self): #close the Qdrant client gracefully
-        """Cleanup Qdrant client resources"""
-        try:
-            if hasattr(self, 'client'):
-                self.client.close()
-        except Exception:
-            pass
-
-    def _ensure_collection(self):
-        collections = [c.name for c in self.client.get_collections().collections]
-        if self.collection not in collections:
-            self.client.create_collection(
-                collection_name=self.collection,
-                vectors_config={
-                    "size": 384,  # all-MiniLM-L6-v2 embedding size
-                    "distance": "Cosine"
-                }
-            )
-
-    def add_exchange(self, user_msg: str, assistant_msg: str):
-        # Combine messages for embedding
-        combined = f"User: {user_msg}\nAssistant: {assistant_msg}"
-        vector = self.embedder.encode(combined).tolist()
-        
-        # Store in Qdrant
-        self.client.upsert(
-            collection_name=self.collection,
-            points=[PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
-                payload={
-                    "user_msg": user_msg,
-                    "assistant_msg": assistant_msg,
-                    "timestamp": datetime.now().isoformat()
-                }
-            )]
-        )
-        self._enforce_limit()
-
-    def _enforce_limit(self):
-        count = self.client.count(self.collection).count
-        if count > self.memory_limit:
-            # Get all points with payload
-            points = []
-            offset = None
-            
-            # Collect all points with pagination
-            while True:
-                batch, next_offset = self.client.scroll(
-                    collection_name=self.collection,
-                    limit=100,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=False
-                )
-                if not batch:
-                    break
-                points.extend(batch)
-                offset = next_offset
-                if next_offset is None:
-                    break
-            
-            if points:
-                # Sort points by timestamp (oldest first)
-                points.sort(key=lambda p: p.payload.get("timestamp", ""))
-                
-                # Calculate how many points to delete
-                points_to_delete = points[:count - self.memory_limit]
-                
-                if points_to_delete:
-                    self.client.delete(
-                        collection_name=self.collection,
-                        points_selector=[p.id for p in points_to_delete]
-                    )
-
-    def search(self, query: str, limit=QDRANT_TOP_K):
-        query_vector = self.embedder.encode(query).tolist()
-        results = self.client.search(
-            collection_name=self.collection,
-            query_vector=query_vector,
-            limit=limit,
-            with_payload=True
-        )
-        return [(hit.payload["user_msg"], 
-                 hit.payload["assistant_msg"], 
-                 hit.payload["timestamp"]) for hit in results]
-
-qdrant_memory = QdrantMemory()
 
 # ─────────────── Universal Workspace Knowledge (with caching) ───────────────
 @dataclass
@@ -348,14 +232,12 @@ MISSING_FIELD_GUIDE = """
 4. Repeat until complete or user skips
 """
 
-# Update make_system_prompt to include RAG context
-def make_system_prompt(know: UniversalWorkspaceKnowledge, rag_context: str = ""):
+def make_system_prompt(know: UniversalWorkspaceKnowledge):
     return (
         "You are an interactive MCP‑driven Notion assistant.\n"
         "You know the full workspace schema and user list.\n"
         + GUARDRAILS
         + MISSING_FIELD_GUIDE
-        + ("\n\n### Relevant Past Exchanges:\n" + rag_context if rag_context else "")
         + "\n" + know.context()
     )
 
@@ -375,12 +257,19 @@ async def build_app():
     tools = await client.get_tools()
     
     # Use faster model configuration
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
-        api_key=CLAUDE_API_KEY, 
-        temperature=0.1,
-        max_tokens=1000,  # Limit response length for faster processing
-        timeout=30  # Set timeout
+    # llm = ChatAnthropic(
+    #     model="claude-sonnet-4-20250514",
+    #     api_key=CLAUDE_API_KEY, 
+    #     temperature=0.1,
+    #     max_tokens=1000,  # Limit response length for faster processing
+    #     timeout=30  # Set timeout
+    # ).bind_tools(tools)
+    llm = ChatOpenAI(
+        model="gpt-5",
+        api_key=OPENAI_API_KEY, 
+        temperature=1
+        # max_tokens=1000,  # Limit response length for faster processing
+        # timeout=30  # Set timeout
     ).bind_tools(tools)
     
     node = ToolNode(tools)
@@ -399,36 +288,12 @@ async def build_app():
     sys_message = SystemMessage(content=system_prompt)
 
     async def agent_fn(state: State):
-        # Add RAG context
-        user_message = ""
-        for m in reversed(state["messages"]):
-            if isinstance(m, HumanMessage):
-                user_message = m.content
-                break
-        
-        rag_results = qdrant_memory.search(user_message) if user_message else []
-        rag_context = ""
-        if rag_results:
-            rag_context = "\n".join(
-                f"- User: {u}\n  Assistant: {a}" for u, a, t in rag_results
-            )
-        
-        sys_message = SystemMessage(content=make_system_prompt(know, rag_context))
-        hist = trim_messages(state["messages"], max_messages=4)
-        
+        hist = trim_messages(state["messages"], max_messages=4)  # Even more aggressive trimming
         try:
             resp = await asyncio.wait_for(
                 llm.ainvoke([sys_message] + hist), 
-                timeout=25
+                timeout=25  # Timeout for LLM calls
             )
-            
-            # Store exchange in memory if it's not a tool call
-            if not getattr(resp, "tool_calls", None):
-                try:
-                    qdrant_memory.add_exchange(user_message, resp.content)
-                except Exception as e:
-                    print(f"Memory storage error: {e}")
-            
             return {"messages": trim_messages(hist + [resp], max_messages=6)}
         except asyncio.TimeoutError:
             error_msg = AIMessage(content="⏰ Request timed out. Please try a simpler query.")
@@ -473,9 +338,6 @@ async def main():
             try:
                 q = input("You: ").strip()
                 if q.lower() in ("quit", "exit", "q"):
-                    if 'qdrant_memory' in globals():
-                        qdrant_memory.cleanup()
-                    print("\n👋 Goodbye!")
                     break
                 
                 print("🤖 Assistant:", end=" ", flush=True)
@@ -498,8 +360,6 @@ async def main():
                 print(f"❌ Error: {e}\n")
                 
     except Exception as e:
-        if 'qdrant_memory' in globals():
-            qdrant_memory.cleanup()
         print(f"❌ Failed to initialize: {e}")
 
 if __name__ == "__main__":
