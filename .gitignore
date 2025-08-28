@@ -1,2 +1,3 @@
 .env
 workspace_cache.pkl
+/node_modules

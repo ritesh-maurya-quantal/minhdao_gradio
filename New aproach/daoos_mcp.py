@@ -272,15 +272,47 @@ class OptimizedState(MessagesState):
     context: Optional[str] = None  # Store context to avoid regeneration
 
 def smart_message_trimming(messages: List, max_messages: int = 8) -> List:
-    """Intelligent message trimming that preserves important context"""
+    """Intelligent message trimming that preserves tool call/response pairs"""
     if len(messages) <= max_messages:
         return messages
     
-    # Always keep the system message and last few messages
+    # Keep system messages
     system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
-    recent_msgs = messages[-(max_messages-1):]
+    non_system = [m for m in messages if not isinstance(m, SystemMessage)]
     
-    return system_msgs + recent_msgs
+    if len(non_system) <= max_messages - len(system_msgs):
+        return system_msgs + non_system
+    
+    # Smart trimming that preserves tool call/response pairs
+    keep_messages = []
+    i = len(non_system) - 1
+    
+    while i >= 0 and len(keep_messages) < (max_messages - len(system_msgs)):
+        current_msg = non_system[i]
+        
+        # If this is a tool message, find its corresponding tool call
+        if isinstance(current_msg, ToolMessage):
+            # Find the AI message with tool calls that this responds to
+            for j in range(i-1, -1, -1):
+                if isinstance(non_system[j], AIMessage) and getattr(non_system[j], 'tool_calls', None):
+                    # Check if this tool call matches
+                    for tool_call in non_system[j].tool_calls:
+                        if tool_call['id'] == current_msg.tool_call_id:
+                            # Add both messages as a pair
+                            keep_messages.insert(0, non_system[j])
+                            keep_messages.insert(1, current_msg)
+                            i = j - 1
+                            break
+                    break
+            else:
+                # No matching tool call found, skip this tool message
+                i -= 1
+        else:
+            # Add regular messages
+            keep_messages.insert(0, current_msg)
+            i -= 1
+    
+    return system_msgs + keep_messages
 
 async def build_optimized_app():
     logger.info("🚀 Initializing optimized MCP client...")
@@ -291,13 +323,13 @@ async def build_optimized_app():
     
     # Optimized model configuration with streaming
     llm = ChatOpenAI(
-        model="gpt-4o",  # Use gpt-4o for better speed/quality balance
+        model="gpt-4o-mini",  # Use gpt-4o for better speed/quality balance
         api_key=OPENAI_API_KEY,
         temperature=0.1,  # Lower for more consistent responses
         max_tokens=2000,  # Reasonable limit
-        timeout=20,
+        timeout=120,
         streaming=True,  # Enable streaming for perceived speed
-        max_retries=3,   # Reduce retries for faster failure
+        max_retries=2,   # Reduce retries for faster failure
     ).bind_tools(tools)
     
     node = ToolNode(tools)
@@ -315,31 +347,75 @@ async def build_optimized_app():
     system_prompt = make_optimized_system_prompt(know)
     sys_message = SystemMessage(content=system_prompt)
 
-    # Use create_react_agent for better performance
-    def create_optimized_agent():
-        return create_react_agent(
-            llm, 
-            tools, 
-            state_modifier=sys_message,
-            checkpointer=MemorySaver(),
-            store=InMemoryStore()  # Use in-memory store for speed
-        )
-
-    # Fallback to custom agent if create_react_agent doesn't work
+    # Custom agent function with proper message handling
     async def agent_fn(state: OptimizedState):
-        hist = smart_message_trimming(state["messages"], max_messages=6)
+        # Get all messages and ensure proper pairing
+        all_messages = state["messages"]
+        
+        # Filter and prepare messages for the LLM
+        prepared_messages = []
+        
+        # Always include system message first
+        prepared_messages.append(sys_message)
+        
+        # Add conversation messages, ensuring tool call/response pairs
+        conversation_msgs = [m for m in all_messages if not isinstance(m, SystemMessage)]
+        
+        # Keep only the most recent meaningful conversation
+        if len(conversation_msgs) > 10:  # Keep more messages but clean
+            conversation_msgs = conversation_msgs[-10:]
+        
+        # Validate message sequence
+        valid_messages = []
+        for i, msg in enumerate(conversation_msgs):
+            if isinstance(msg, ToolMessage):
+                # Only include tool messages that have a preceding tool call
+                if valid_messages and isinstance(valid_messages[-1], AIMessage):
+                    if hasattr(valid_messages[-1], 'tool_calls') and valid_messages[-1].tool_calls:
+                        # Check if tool call ID matches
+                        tool_call_ids = [tc['id'] for tc in valid_messages[-1].tool_calls]
+                        if msg.tool_call_id in tool_call_ids:
+                            valid_messages.append(msg)
+                # Skip orphaned tool messages
+            else:
+                valid_messages.append(msg)
+        
+        prepared_messages.extend(valid_messages)
+        
         try:
             # Use asyncio.create_task for better concurrency
-            task = asyncio.create_task(llm.ainvoke([sys_message] + hist))
+            task = asyncio.create_task(llm.ainvoke(prepared_messages))
             resp = await asyncio.wait_for(task, timeout=20)
-            return {"messages": smart_message_trimming(hist + [resp], max_messages=8)}
+            
+            # Return with properly managed messages
+            return {"messages": all_messages + [resp]}
+            
         except asyncio.TimeoutError:
             error_msg = AIMessage(content="⏰ Request timed out. Please try a simpler query.")
-            return {"messages": smart_message_trimming(hist + [error_msg], max_messages=8)}
+            return {"messages": all_messages + [error_msg]}
         except Exception as e:
             logger.error(f"Agent error: {e}")
+            # Check if it's a tool message validation error
+            if "tool" in str(e).lower() and "role" in str(e).lower():
+                logger.info("🔧 Cleaning message history due to tool message error")
+                # Start fresh but keep the latest human message
+                latest_human = None
+                for msg in reversed(all_messages):
+                    if isinstance(msg, HumanMessage):
+                        latest_human = msg
+                        break
+                
+                if latest_human:
+                    clean_messages = [latest_human]
+                    task = asyncio.create_task(llm.ainvoke([sys_message] + clean_messages))
+                    try:
+                        resp = await asyncio.wait_for(task, timeout=20)
+                        return {"messages": clean_messages + [resp]}
+                    except Exception as e2:
+                        logger.error(f"Retry failed: {e2}")
+            
             error_msg = AIMessage(content=f"❌ Error: {str(e)}")
-            return {"messages": smart_message_trimming(hist + [error_msg], max_messages=8)}
+            return {"messages": all_messages + [error_msg]}
 
     def router(state: OptimizedState) -> str:
         last = state["messages"][-1]
@@ -348,50 +424,78 @@ async def build_optimized_app():
         return END
 
     async def optimized_tool_node(state: OptimizedState):
-        """Optimized tool node with parallel execution where possible"""
+        """Optimized tool node with proper error handling"""
         try:
             # Use asyncio.wait_for with a reasonable timeout
             result = await asyncio.wait_for(node.ainvoke(state), timeout=25)
-            result["messages"] = smart_message_trimming(result["messages"], max_messages=8)
+            
+            # Don't trim messages here to preserve tool call/response pairs
             return result
+            
         except asyncio.TimeoutError:
             logger.warning("Tool execution timed out")
-            error_msg = ToolMessage(
-                content="⏰ Tool execution timed out. Please try a simpler operation.", 
-                tool_call_id="timeout"
-            )
-            return {"messages": smart_message_trimming(state["messages"] + [error_msg], max_messages=8)}
+            
+            # Find the last AI message with tool calls to respond to
+            last_ai_msg = None
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    last_ai_msg = msg
+                    break
+            
+            if last_ai_msg and last_ai_msg.tool_calls:
+                # Create timeout responses for each tool call
+                timeout_responses = []
+                for tool_call in last_ai_msg.tool_calls:
+                    timeout_responses.append(ToolMessage(
+                        content="⏰ Tool execution timed out. Please try a simpler operation.", 
+                        tool_call_id=tool_call['id']
+                    ))
+                return {"messages": state["messages"] + timeout_responses}
+            else:
+                # Fallback error message
+                error_msg = AIMessage(content="⏰ Tool execution timed out. Please try a simpler operation.")
+                return {"messages": state["messages"] + [error_msg]}
+                
         except Exception as e:
             logger.error(f"Tool error: {e}")
-            error_msg = ToolMessage(
-                content=f"❌ Tool error: {str(e)}", 
-                tool_call_id="error"
-            )
-            return {"messages": smart_message_trimming(state["messages"] + [error_msg], max_messages=8)}
+            
+            # Find the last AI message with tool calls to respond to
+            last_ai_msg = None
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    last_ai_msg = msg
+                    break
+            
+            if last_ai_msg and last_ai_msg.tool_calls:
+                # Create error responses for each tool call
+                error_responses = []
+                for tool_call in last_ai_msg.tool_calls:
+                    error_responses.append(ToolMessage(
+                        content=f"❌ Tool error: {str(e)}", 
+                        tool_call_id=tool_call['id']
+                    ))
+                return {"messages": state["messages"] + error_responses}
+            else:
+                # Fallback error message
+                error_msg = AIMessage(content=f"❌ Tool error: {str(e)}")
+                return {"messages": state["messages"] + [error_msg]}
 
-    # Try to use the optimized agent first
-    try:
-        return create_optimized_agent()
-    except Exception as e:
-        logger.warning(f"Falling back to custom agent: {e}")
-        
-        # Custom optimized workflow
-        wf = StateGraph(OptimizedState)
-        wf.add_node("agent", agent_fn)
-        wf.add_node("tools", optimized_tool_node)
-        wf.add_edge(START, "agent")
-        wf.add_conditional_edges("agent", router, {"tools": "tools", END: END})
-        wf.add_edge("tools", "agent")
-        
-        return wf.compile(checkpointer=MemorySaver())
+    # Build the workflow with custom agents (more reliable than create_react_agent)
+    wf = StateGraph(OptimizedState)
+    wf.add_node("agent", agent_fn)
+    wf.add_node("tools", optimized_tool_node)
+    wf.add_edge(START, "agent")
+    wf.add_conditional_edges("agent", router, {"tools": "tools", END: END})
+    wf.add_edge("tools", "agent")
+    
+    return wf.compile(checkpointer=MemorySaver())
 
 # ──────────────────────────── Optimized Main with Streaming ────────────────────────────
 async def main():
     try:
         app = await build_optimized_app()
         logger.info("✨ High-performance MCP-driven Notion assistant ready! Type 'quit' to exit.\n")
-        config = {"configurable": {"thread_id": "mcp_session"}}
-
+        
         while True:
             try:
                 q = input("\n💬 You: ").strip()
@@ -399,6 +503,10 @@ async def main():
                     break
                 
                 print("🤖 Assistant:", end=" ", flush=True)
+                
+                # Use a clean thread ID for each session to avoid message history issues
+                thread_id = f"mcp_session_{int(asyncio.get_event_loop().time())}"
+                config = {"configurable": {"thread_id": thread_id}}
                 
                 # Use asyncio.create_task for better performance
                 start_time = asyncio.get_event_loop().time()
