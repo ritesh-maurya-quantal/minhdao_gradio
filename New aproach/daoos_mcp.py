@@ -10,6 +10,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import aiofiles
 import logging
+import gradio as gr  # Add this import
 
 from langchain_openai import ChatOpenAI
 # LangChain / LangGraph / MCP
@@ -352,12 +353,12 @@ async def build_optimized_app():
 
     # Optimized model configuration with streaming
     llm = ChatOpenAI(
-        model="gpt-4o-mini",
+        model="gpt-4o",
         api_key=OPENAI_API_KEY,
-        temperature=0.1,
+        # temperature=0.1,
         max_tokens=2000,
         timeout=120,
-        streaming=True,
+        # streaming=True,
         max_retries=2,
     ).bind_tools(tools)
 
@@ -535,41 +536,62 @@ async def main():
         logger.error(f"Failed to initialize: {e}")
         print(f"❌ Failed to initialize: {e}")
 
-# if __name__ == "__main__":
-#     # Use uvloop for better async performance on Unix systems
-#     # try:
-#     #     import uvloop
-#     #     uvloop.install()
-#     #     logger.info("🚀 Using uvloop for enhanced performance")
-#     # except ImportError:
-#     #     logger.info("📝 Using default asyncio event loop")
+# Minimal async chat handler for Gradio with per-session history
+async def gradio_chat(user_input, history):
+    if history is None:
+        history = []
+    # Build messages from history
+    messages = []
+    for msg in history:
+        # msg is a dict with 'role' and 'content'
+        if msg["role"] == "user":
+            messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            messages.append(AIMessage(content=msg["content"]))
+    messages.append(HumanMessage(content=user_input))
 
-#     asyncio.run(main())
+    # Build the app/workflow once and cache it
+    if not hasattr(gradio_chat, "app"):
+        gradio_chat.app = await build_optimized_app()
+    app = gradio_chat.app
 
-# Function to interface with the agent
-def interact_with_agent(user_input):
-    # Call the existing assistant function or workflow here
+    thread_id = f"gradio_session_{len(history)}_{int(asyncio.get_event_loop().time())}"
+    config = {"configurable": {"thread_id": thread_id}}
+
+    import time
+    start_time = time.perf_counter()
     try:
-        result = asyncio.run(main_input(user_input))
-        return result['messages'][-1].content  # Assuming this is the response
+        result = await app.ainvoke({"messages": messages}, config=config)
+        bot_reply = result["messages"][-1].content
     except Exception as e:
-        return f"Error: {str(e)}"
+        bot_reply = f"❌ Error: {e}"
+    elapsed = time.perf_counter() - start_time
 
-# Create a Gradio interface
-def create_gradio_interface():
-    # Create a Gradio interface for text input/output
-    iface = gr.Interface(
-        fn=interact_with_agent,  # The function to call when the user inputs text
-        inputs=gr.Textbox(lines=5, placeholder="Ask me anything..."),  # Input area
-        outputs=gr.Textbox(lines=5, placeholder="Response will appear here..."),  # Output area
-        live=True,  # Set to True for live updates while typing (optional)
-        title="Notion MCP AI Assistant",  # Title of the interface
-        description="Interact with the Notion MCP-driven AI assistant. Ask anything, and it will respond based on workspace data."
-    )
+    # Append as OpenAI-style dicts for gr.Chatbot(type='messages')
+    history = history + [
+        {"role": "user", "content": user_input},
+        {"role": "assistant", "content": f"{bot_reply}\n\n⏱️ Response time: {elapsed:.2f}s"},
+    ]
+    return history, history
 
-    # Launch the interface
-    iface.launch(share=True)  # Set 'share=True' if you want to share the interface publicly
+def launch_gradio():
+    with gr.Blocks() as demo:
+        gr.Markdown("# Notion MCP AI Assistant\nAsk anything about your Notion workspace.")
+        chatbot = gr.Chatbot(type='messages')  # Use OpenAI-style messages
+        state = gr.State([])  # Per-session chat history
+
+        with gr.Row():
+            txt = gr.Textbox(show_label=False, placeholder="Type your message and press Enter")
+
+        txt.submit(
+            gradio_chat,
+            inputs=[txt, state],
+            outputs=[chatbot, state],
+            queue=True,
+            api_name="chat"
+        )
+    demo.launch(share=False)
 
 # If this is the main module, start the Gradio interface
 if __name__ == "__main__":
-    create_gradio_interface()
+    launch_gradio()
